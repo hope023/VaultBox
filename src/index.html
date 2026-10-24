@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VaultBox 文件保险箱</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">🔐</span> VaultBox <span class="ver" id="ver"></span></div>
+      <nav class="nav">
+        <button id="nav-vault" class="nav-btn on">保险箱</button>
+        <button id="nav-hide" class="nav-btn">快速隐藏</button>
+      </nav>
+    </header>
+
+    <!-- ============ 保险箱页 ============ -->
+    <main id="page-vault" class="page">
+      <div class="path-bar">
+        <input id="vault-path" class="path-input" placeholder="选择或输入保险箱文件夹路径…" spellcheck="false" />
+        <button id="btn-pick-dir" class="btn">浏览…</button>
+        <button id="btn-refresh" class="btn" title="重新读取状态">刷新</button>
+      </div>
+
+      <div id="vault-body">
+        <!-- 状态卡由 app.js 渲染 -->
+      </div>
+    </main>
+
+    <!-- ============ 快速隐藏页 ============ -->
+    <main id="page-hide" class="page" hidden>
+      <div class="path-bar">
+        <input id="hide-path" class="path-input" placeholder="选择要隐藏/显示的文件或文件夹…" spellcheck="false" />
+        <button id="btn-hide-pick" class="btn">浏览…</button>
+        <button id="btn-hide-toggle" class="btn primary">切换隐藏</button>
+      </div>
+      <div class="hint">
+        仅切换 Windows「隐藏」属性：资源管理器开启「显示隐藏的项目」后依然可见。
+        <b>防误看，不防懂行的人</b> —— 需要真正保护请用左侧「保险箱」加密。
+      </div>
+      <div id="hide-state" class="hide-state">尚未选择路径</div>
+      <div id="hide-children" class="hide-children"></div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="modal" class="modal" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
