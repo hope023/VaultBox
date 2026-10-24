@@ -90,7 +90,7 @@ pub fn create(root: &Path, password: &str, force: bool) -> Result<(), String> {
 
 /// 解锁：验密 → 恢复残留批次 → 明文树物化。返回 (密钥, 文件数)。
 /// 密钥由 commands 层在会话期持有（自动上锁时 zeroize 释放）。
-pub fn unlock(root: &Path, password: &str) -> Result<(VaultKey, u32), String> {
+pub fn unlock(root: &Path, password: &str, progress: &dyn Fn(usize, usize)) -> Result<(VaultKey, u32), String> {
     let meta = read_meta(root)?;
     let key = store::derive_and_verify(&meta, password)?;
 
@@ -103,7 +103,9 @@ pub fn unlock(root: &Path, password: &str) -> Result<(VaultKey, u32), String> {
     write_journal(root, &Journal::new("unlock", rels, Vec::new()))?;
 
     let mut count = 0u32;
-    for (rel, entry) in &index.files {
+    let total = index.files.len();
+    progress(0, total);
+    for (i, (rel, entry)) in index.files.iter().enumerate() {
         let target = plain_path(root, rel);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -112,12 +114,14 @@ pub fn unlock(root: &Path, password: &str) -> Result<(VaultKey, u32), String> {
         if let Ok(m) = target.metadata() {
             if m.len() == entry.size {
                 count += 1;
+                progress(i + 1, total);
                 continue;
             }
         }
         key.open_file(&data_dir(root).join(&entry.blob), &target)
             .map_err(|e| format!("还原 {rel} 失败: {e}"))?;
         count += 1;
+        progress(i + 1, total);
     }
     // 重建空目录（索引里记录的 dirs）
     for d in &index.dirs {
@@ -148,7 +152,7 @@ fn recover(root: &Path, key: &VaultKey, j: &Journal) -> Result<(), String> {
                 return Ok(());
             }
             // 明文还在 → 完整重跑上锁
-            let _ = do_lock(root, key, &index)?;
+let _ = do_lock(root, key, &index, &|_, _| {})?;
             Ok(())
         }
         other => Err(format!("未知批次类型：{other}（元数据损坏）")),
@@ -183,22 +187,22 @@ fn gc_blobs(root: &Path, key: &VaultKey) -> Result<u32, String> {
 /// 上锁（要求当前处于解锁态：明文树存在）。
 /// 容错语义：被占用的文件（如正在运行的游戏）跳过删除、保持明文，
 /// 其余照常加密；结果里的 busy 报告跳过数，下次上锁自动补齐。
-pub fn lock(root: &Path, key: &VaultKey) -> Result<LockOutcome, String> {
+pub fn lock(root: &Path, key: &VaultKey, progress: &dyn Fn(usize, usize)) -> Result<LockOutcome, String> {
     if let Some(j) = read_journal(root) {
         recover(root, key, &j)?;
     }
     let index = read_index(root, key)?;
-    do_lock(root, key, &index)
+    do_lock(root, key, &index, progress)
 }
 
 /// 无会话时的上锁：凭密码派生密钥（程序重启后箱仍处于解锁态时走这条路）
-pub fn lock_with_password(root: &Path, password: &str) -> Result<LockOutcome, String> {
+pub fn lock_with_password(root: &Path, password: &str, progress: &dyn Fn(usize, usize)) -> Result<LockOutcome, String> {
     let meta = read_meta(root)?;
     let key = store::derive_and_verify(&meta, password)?;
-    lock(root, &key)
+    lock(root, &key, progress)
 }
 
-fn do_lock(root: &Path, key: &VaultKey, old_index: &VaultIndex) -> Result<LockOutcome, String> {
+fn do_lock(root: &Path, key: &VaultKey, old_index: &VaultIndex, progress: &dyn Fn(usize, usize)) -> Result<LockOutcome, String> {
     let plain = walk_plain_files(root)?;
 
     let rels: Vec<String> = plain.iter().map(|p| p.rel.clone()).collect();
@@ -211,7 +215,9 @@ fn do_lock(root: &Path, key: &VaultKey, old_index: &VaultIndex) -> Result<LockOu
     let mut busy: u32 = 0;
     let mut unsealable: BTreeSet<String> = BTreeSet::new();
 
-    for item in &plain {
+    let total = plain.len();
+    progress(0, total);
+    for (i, item) in plain.iter().enumerate() {
         let abs = &item.abs;
         let old = old_index.files.get(&item.rel);
         let unchanged = old.map(|e| e.size == item.size && e.mtime_ms == item.mtime_ms);
@@ -244,6 +250,7 @@ fn do_lock(root: &Path, key: &VaultKey, old_index: &VaultIndex) -> Result<LockOu
                     FileEntry { blob, size: item.size, mtime_ms: item.mtime_ms },
                 );
                 handled += 1;
+        progress(i + 1, total);
             }
             None => {
                 // 无法加密的文件留在明文树中（下次上锁重试）
@@ -370,13 +377,13 @@ fn walk_plain_dirs(root: &Path) -> Result<Vec<String>, String> {
 
 /// 导入（解锁态）：把外部文件/文件夹复制进明文树并立即加密成 blob。
 /// 复制（保留原件）。返回导入文件数。
-pub fn import(root: &Path, key: &VaultKey, sources: &[String]) -> Result<u32, String> {
+pub fn import(root: &Path, key: &VaultKey, sources: &[String], progress: &dyn Fn(usize, usize)) -> Result<u32, String> {
     if let Some(j) = read_journal(root) {
         recover(root, key, &j)?;
     }
     let mut index = read_index(root, &key)?;
-    let mut imported: Vec<(String, String)> = Vec::new(); // (rel, blob)
-
+    // 先枚举全部待导入文件（total 已知才能显示进度）
+    let mut jobs: Vec<(String, PathBuf)> = Vec::new();
     for src in sources {
         let src = PathBuf::from(src);
         if !src.exists() {
@@ -398,12 +405,20 @@ pub fn import(root: &Path, key: &VaultKey, sources: &[String]) -> Result<u32, St
                     .to_string_lossy()
                     .replace('\\', "/");
                 let rel = normalize_rel(&format!("{base_name}/{sub}"))?;
-                imported.push(import_one(root, key, &mut index, &rel, entry.path())?);
+                jobs.push((rel, entry.path().to_path_buf()));
             }
         } else {
             let rel = normalize_rel(&base_name)?;
-            imported.push(import_one(root, key, &mut index, &rel, &src)?);
+            jobs.push((rel, src));
         }
+    }
+
+    let total = jobs.len();
+    progress(0, total);
+    let mut imported: Vec<(String, String)> = Vec::new(); // (rel, blob)
+    for (i, (rel, src_abs)) in jobs.iter().enumerate() {
+        imported.push(import_one(root, key, &mut index, rel, src_abs)?);
+        progress(i + 1, total);
     }
 
     write_journal(root, &Journal::new("import", Vec::new(), imported.iter().map(|(_, b)| b.clone()).collect()))?;
@@ -511,7 +526,7 @@ mod tests {
         let root = dir.path().join("箱");
         fs::create_dir_all(&root).unwrap();
         create(&root, PW, false).unwrap();
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         for (rel, content) in files {
             let p = plain_path(&root, rel);
             if let Some(parent) = p.parent() {
@@ -519,15 +534,15 @@ mod tests {
             }
             fs::write(&p, content).unwrap();
         }
-        lock(&root, &key).unwrap();
+        lock(&root, &key, &|_, _| {}).unwrap();
         (dir, root)
     }
 
     /// 解锁 → 操作明文 → 上锁 的一体化小工具
     fn with_unlocked(root: &Path, f: impl FnOnce(&Path)) {
-        let (key, _) = unlock(root, PW).unwrap();
+        let (key, _) = unlock(root, PW, &|_, _| {}).unwrap();
         f(root);
-        lock(root, &key).unwrap();
+        lock(root, &key, &|_, _| {}).unwrap();
     }
 
     fn disk_has_plaintext(root: &Path) -> bool {
@@ -568,7 +583,7 @@ mod tests {
     #[test]
     fn wrong_password_cannot_unlock() {
         let (_guard, root) = make_vault_with(&[("a.txt", "x")]);
-        assert!(unlock(&root, "错误密码").is_err());
+        assert!(unlock(&root, "错误密码", &|_, _| {}).is_err());
     }
 
     #[test]
@@ -607,20 +622,20 @@ mod tests {
         let root = dir.path().join("箱");
         fs::create_dir_all(&root).unwrap();
         create(&root, PW, false).unwrap();
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
 
         let src = dir.path().join("外部资料");
         fs::create_dir_all(src.join("子目录")).unwrap();
         fs::write(src.join("子目录/资料.txt"), "导入内容").unwrap();
         fs::write(src.join("根文件.md"), "# md").unwrap();
 
-        let n = import(&root, &key, &[src.to_string_lossy().to_string()]).unwrap();
+        let n = import(&root, &key, &[src.to_string_lossy().to_string()], &|_, _| {}).unwrap();
         assert_eq!(n, 2);
         assert!(plain_path(&root, "外部资料/子目录/资料.txt").exists());
 
-        lock(&root, &key).unwrap();
+        lock(&root, &key, &|_, _| {}).unwrap();
         assert!(!disk_has_plaintext(&root));
-        let (key2, _) = unlock(&root, PW).unwrap();
+        let (key2, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         assert_eq!(
             fs::read_to_string(plain_path(&root, "外部资料/子目录/资料.txt")).unwrap(),
             "导入内容"
@@ -632,25 +647,25 @@ mod tests {
     fn crash_during_lock_recovers() {
         let (_guard, root) = make_vault_with(&[("a.txt", "aaa"), ("b.txt", "bbb")]);
         // 模拟上锁中途崩溃：残留 journal
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         write_journal(&root, &Journal::new("lock", vec!["a.txt".into(), "b.txt".into()], vec![])).unwrap();
         // 下一次解锁触发恢复（明文树还在 → 重跑上锁语义）
         let _ = key;
-        let (key2, _) = unlock(&root, PW).unwrap();
+        let (key2, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         assert!(read_journal(&root).is_none());
         assert!(plain_path(&root, "a.txt").exists());
-        lock(&root, &key2).unwrap();
+        lock(&root, &key2, &|_, _| {}).unwrap();
         assert!(!disk_has_plaintext(&root));
     }
 
     #[test]
     fn crash_during_import_gc_blobs() {
         let (_guard, root) = make_vault_with(&[("a.txt", "aaa")]);
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         let orphan = data_dir(&root).join(VaultKey::random_blob_name());
         fs::write(&orphan, b"garbage").unwrap();
         write_journal(&root, &Journal::new("import", vec![], vec![])).unwrap();
-        lock(&root, &key).unwrap();
+        lock(&root, &key, &|_, _| {}).unwrap();
         assert!(!orphan.exists(), "无引用 blob 应被 GC");
         assert_eq!(data_blob_names(&root).len(), 1);
     }
@@ -684,7 +699,7 @@ mod tests {
         // Windows 上以独占方式打开的文件无法删除 —— 模拟“游戏正在运行”：
         // 上锁应容错跳过该文件（busy=1），其余文件正常加密，且不卡死后续解锁。
         let (_guard, root) = make_vault_with(&[("正常.txt", "ok"), ("游戏/exe主程序.exe", "GAME")]);
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         let busy = root.join("游戏/exe主程序.exe");
         // 独占打开（share_mode=0：不允许删除）
         use std::os::windows::fs::OpenOptionsExt;
@@ -693,18 +708,18 @@ mod tests {
             .share_mode(0)
             .open(&busy)
             .expect("独占打开失败（测试环境异常）");
-        let outcome = lock(&root, &key).unwrap();
+        let outcome = lock(&root, &key, &|_, _| {}).unwrap();
         assert_eq!(outcome.busy, 1, "占用文件应被跳过计数");
         assert!(busy.exists(), "被占用文件保持明文");
         assert!(!plain_path(&root, "正常.txt").exists(), "其余文件正常加密");
         drop(_held);
         // 关闭占用后再次上锁：补齐删除，全部入箱
-        let (key2, _) = unlock(&root, PW).unwrap();
-        let out2 = lock(&root, &key2).unwrap();
+        let (key2, _) = unlock(&root, PW, &|_, _| {}).unwrap();
+        let out2 = lock(&root, &key2, &|_, _| {}).unwrap();
         assert_eq!(out2.busy, 0);
         assert!(!disk_has_plaintext(&root));
         // 数据完好
-        let (key3, _) = unlock(&root, PW).unwrap();
+        let (key3, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         assert_eq!(fs::read(plain_path(&root, "游戏/exe主程序.exe")).unwrap(), b"GAME");
         let _ = key3;
     }
@@ -716,7 +731,7 @@ mod tests {
         let root = dir.path().join("箱");
         fs::create_dir_all(&root).unwrap();
         create(&root, PW, false).unwrap();
-        let (key, _) = unlock(&root, PW).unwrap();
+        let (key, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         let big_path = plain_path(&root, "大文件.bin");
         {
             let mut f = fs::File::create(&big_path).unwrap();
@@ -728,9 +743,9 @@ mod tests {
             }
         }
         let expect = fs::read(&big_path).unwrap();
-        lock(&root, &key).unwrap();
+        lock(&root, &key, &|_, _| {}).unwrap();
         assert!(!disk_has_plaintext(&root));
-        let (key2, _) = unlock(&root, PW).unwrap();
+        let (key2, _) = unlock(&root, PW, &|_, _| {}).unwrap();
         assert_eq!(fs::read(&big_path).unwrap(), expect, "3MB 文件逐字节一致");
         let _ = key2;
     }

@@ -127,7 +127,11 @@ async function busy(btn, fn) {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span>处理中…';
   try { return await fn(); }
-  finally { btn.disabled = false; btn.innerHTML = old; }
+  finally {
+    btn.disabled = false;
+    btn.innerHTML = old;
+    hideProgress();
+  }
 }
 
 /* ---------------- 保险箱页 ---------------- */
@@ -286,12 +290,17 @@ async function loadFiles() {
       tb.innerHTML = '<tr><td colspan="3" class="muted">（空）用上方按钮导入，或直接把文件放进文件夹</td></tr>';
       return;
     }
-    tb.innerHTML = rows.map((r) =>
+    const CAP = 400;
+    const shown = rows.slice(0, CAP);
+    tb.innerHTML = shown.map((r) =>
       '<tr class="' + (r.is_dir ? "dir" : "") + '">'
       + '<td class="path">' + (r.is_dir ? "📁 " : "📄 ") + escapeHtml(r.path) + '</td>'
       + '<td>' + (r.is_dir ? "—" : fmtSize(r.size)) + '</td>'
       + '<td class="muted">' + (r.is_dir ? "" : fmtTime(r.mtime_ms)) + '</td>'
-      + '</tr>').join("");
+      + '</tr>').join("")
+      + (rows.length > CAP
+        ? '<tr><td colspan="3" class="muted">共 ' + rows.length + ' 项，已显示前 ' + CAP + ' 项（文件太多，其余仍在箱中安全保存）</td></tr>'
+        : "");
   } catch (e) {
     const tb = $("file-rows");
     if (tb) tb.innerHTML = '<tr><td colspan="3" class="muted">读取失败：' + escapeHtml(String(e)) + '</td></tr>';
@@ -391,6 +400,26 @@ setInterval(async () => {
   } catch (_) { /* 会话不存在等，忽略 */ }
 }, 5000);
 
+/* 进度推送（解锁/上锁/导入，来自 Rust spawn_blocking） */
+const PHASE_NAME = { unlock: "解锁中", lock: "加密上锁中", import: "导入并加密中" };
+window.__TAURI__.event.listen("vault-progress", (ev) => {
+  const p = ev.payload || {};
+  const prog = document.getElementById("prog");
+  const text = document.getElementById("prog-text");
+  if (!prog || !text) return;
+  const name = PHASE_NAME[p.phase] || "处理中";
+  if (p.total > 0 && p.done >= p.total) {
+    text.textContent = name + " " + p.total + "/" + p.total + "，收尾中…";
+  } else {
+    text.textContent = name + " " + (p.done || 0) + "/" + p.total + " …";
+  }
+  prog.hidden = false;
+});
+function hideProgress() {
+  const prog = document.getElementById("prog");
+  if (prog) prog.hidden = true;
+}
+
 /* 拖拽导入：Tauri 拖放事件提供文件/文件夹的真实绝对路径 */
 window.__TAURI__.event.listen("tauri://drag-over", () => {
   document.body.classList.add("dragging");
@@ -441,6 +470,7 @@ window.__TAURI__.event.listen("vault-exit-lock-failed", (ev) => {
 
 /* 自动上锁事件 → 刷新界面 */
 window.__TAURI__.event.listen("vault-auto-locked", (ev) => {
+  hideProgress();
   toast("已自动上锁：" + ev.payload.root);
   refreshStatus(true);
 });

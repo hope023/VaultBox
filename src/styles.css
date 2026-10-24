@@ -152,3 +152,13 @@ body.dragging::after {
   display: flex; align-items: center; justify-content: center;
   pointer-events: none; z-index: 40;
 }
+
+/* 进度提示（大文件量时的转圈圈） */
+.prog-wrap {
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+  background: var(--card); border: 1px solid var(--primary);
+  color: var(--fg); padding: 8px 18px; border-radius: 999px;
+  font-size: 12.5px; z-index: 55; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+  display: flex; align-items: center; gap: 8px; max-width: 80vw;
+}
+.prog-wrap .spin { border-color: var(--primary); border-top-color: transparent; }

@@ -1,8 +1,12 @@
 //! Tauri 命令门面：前端唯一入口。
 //!
-//! 会话模型：解锁成功后密钥驻留本进程内存（AppState::session），
+//! 会话模型：解锁成功后密钥驻留本进程内存（AppState::sessions），
 //! 上锁/导入/移除保险箱复用该密钥（无需反复输密码）；空闲自动上锁
-//! 由后台线程执行（见 lib.rs 的 watcher），上锁后密钥 drop（zeroize）。
+//! 由后台线程执行（lib.rs 的 watcher），上锁后密钥 drop（zeroize）。
+//!
+//! 性能模型：重 IO 命令（解锁/上锁/导入/列表/隐藏）一律 async +
+//! spawn_blocking 在工作线程执行 —— 同步命令跑在主线程会阻塞事件循环，
+//! 文件多时窗口"未响应"。进度经 "vault-progress" 事件推送前端。
 
 use crate::crypto::VaultKey;
 use crate::vault::{self, VaultStatus};
@@ -10,6 +14,7 @@ use crate::{hide, store};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tauri::Emitter;
 
 struct Session {
     root: PathBuf,
@@ -54,7 +59,7 @@ fn root_of(path: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-/// 所有已解锁会话的根路径（前端恢复界面用）
+/// 会话中的根路径（前端恢复界面用）
 #[tauri::command]
 pub fn session_roots() -> Vec<String> {
     state()
@@ -71,22 +76,35 @@ pub fn session_roots() -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn vault_status(path: String) -> Result<VaultStatus, String> {
-    Ok(vault::status(&root_of(&path)?))
+pub async fn vault_status(path: String) -> Result<VaultStatus, String> {
+    let root = root_of(&path)?;
+    let s = tauri::async_runtime::spawn_blocking(move || vault::status(&root))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    Ok(s)
 }
 
 #[tauri::command]
-pub fn vault_create(path: String, password: String, force: bool) -> Result<(), String> {
+pub async fn vault_create(path: String, password: String, force: bool) -> Result<(), String> {
     if password.chars().count() < 6 {
         return Err("密码至少 6 个字符".to_string());
     }
     let root = root_of(&path)?;
-    vault::create(&root, &password, force)?;
-    // 创建即解锁：直接建立会话（创建后立即可导入/上锁，无需再输一遍密码）
-    let meta = store::read_meta(&root)?;
-    let key = store::derive_and_verify(&meta, &password)?;
+    let key = {
+        let root2 = root.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            vault::create(&root2, &password, force)?;
+            // 创建即解锁：直接建立会话（创建后立即可导入/上锁，无需再输一遍密码）
+            let meta = store::read_meta(&root2)?;
+            let key = store::derive_and_verify(&meta, &password)?;
+            Ok::<VaultKey, String>(key)
+        })
+    }
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))??;
+    let root2 = root_of(&path)?;
     state().lock().unwrap().sessions.insert(
-        root.clone(),
+        root2,
         Session { root, key, last_activity: Instant::now() },
     );
     Ok(())
@@ -94,7 +112,11 @@ pub fn vault_create(path: String, password: String, force: bool) -> Result<(), S
 
 /// 解锁并建立会话。返回 (文件数, 当前自动上锁秒数)。
 #[tauri::command]
-pub fn vault_unlock(path: String, password: String) -> Result<(u32, u64), String> {
+pub async fn vault_unlock(
+    app: tauri::AppHandle,
+    path: String,
+    password: String,
+) -> Result<(u32, u64), String> {
     let root = root_of(&path)?;
     {
         let mut s = state().lock().unwrap();
@@ -107,7 +129,19 @@ pub fn vault_unlock(path: String, password: String) -> Result<(u32, u64), String
             s.fail_count = 0;
         }
     }
-    match vault::unlock(&root, &password) {
+    let app2 = app.clone();
+    let root2 = root.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        vault::unlock(&root2, &password, &|done, total| {
+            let _ = app2.emit(
+                "vault-progress",
+                serde_json::json!({ "phase": "unlock", "done": done, "total": total }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?;
+    match res {
         Ok((key, n)) => {
             let auto = {
                 let mut s = state().lock().unwrap();
@@ -134,53 +168,118 @@ pub fn vault_unlock(path: String, password: String) -> Result<(u32, u64), String
     }
 }
 
-/// 取指定路径的会话并刷新活动时间
-fn with_session<T>(
-    path: &str,
-    f: impl FnOnce(&PathBuf, &VaultKey) -> Result<T, String>,
-) -> Result<T, String> {
-    let root = root_of(path)?;
-    let mut s = state().lock().unwrap();
-    let session = s
-        .sessions
-        .get_mut(&root)
-        .ok_or("需要密码：当前没有该保险箱的解锁会话")?;
-    session.last_activity = Instant::now();
-    f(&session.root, &session.key)
-}
-
 /// 上锁：优先用现有会话；无会话（如程序重启后箱仍处于解锁态）则凭密码。
 #[tauri::command]
-pub fn vault_lock(path: String, password: Option<String>) -> Result<vault::LockOutcome, String> {
+pub async fn vault_lock(
+    app: tauri::AppHandle,
+    path: String,
+    password: Option<String>,
+) -> Result<vault::LockOutcome, String> {
     let root = root_of(&path)?;
-    let result = match with_session(&path, |root, key| vault::lock(root, key)) {
-        Ok(r) => r,
-        Err(sess_err) => match password {
-            Some(pw) if !pw.is_empty() => vault::lock_with_password(&root, &pw)?,
+    // 取会话（有则用密钥并摘除；无则用前端传来的密码）
+    let session = state().lock().unwrap().sessions.remove(&root);
+    let app2 = app.clone();
+    let job = match &session {
+        Some(sess) => {
+            let root2 = sess.root.clone();
+            let key = sess.key.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                vault::lock(&root2, &key, &|done, total| {
+                    let _ = app2.emit(
+                        "vault-progress",
+                        serde_json::json!({ "phase": "lock", "done": done, "total": total }),
+                    );
+                })
+            })
+        }
+        None => match password {
+            Some(pw) if !pw.is_empty() => {
+                let app3 = app2.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    vault::lock_with_password(&root, &pw, &|done, total| {
+                        let _ = app3.emit(
+                            "vault-progress",
+                            serde_json::json!({ "phase": "lock", "done": done, "total": total }),
+                        );
+                    })
+                })
+            }
             // 前端据该错误弹出密码框后带密码重试
-            _ => return Err(sess_err),
+            _ => {
+                state().lock().unwrap().sessions.insert(root, session.unwrap());
+                return Err("需要密码：当前没有该保险箱的解锁会话".to_string());
+            }
         },
     };
-    state().lock().unwrap().sessions.remove(&root);
-    Ok(result)
+    let outcome = job.await.map_err(|e| format!("任务执行失败: {e}"))?;
+    match outcome {
+        Ok(o) => Ok(o),
+        Err(e) => {
+            // 硬错误（journal/meta 损坏等）：恢复会话让用户可重试
+            if let Some(sess) = session {
+                state().lock().unwrap().sessions.insert(sess.root.clone(), sess);
+            }
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
-pub fn vault_import(path: String, sources: Vec<String>) -> Result<u32, String> {
-    with_session(&path, |root, key| vault::import(root, key, &sources))
-}
-
-#[tauri::command]
-pub fn vault_list(path: String) -> Result<Vec<vault::FileRow>, String> {
-    vault::list_files(&root_of(&path)?)
-}
-
-#[tauri::command]
-pub fn vault_dissolve(path: String) -> Result<(), String> {
+pub async fn vault_import(
+    app: tauri::AppHandle,
+    path: String,
+    sources: Vec<String>,
+) -> Result<u32, String> {
     let root = root_of(&path)?;
-    with_session(&path, |r, key| vault::dissolve(r, key))?;
-    state().lock().unwrap().sessions.remove(&root);
-    Ok(())
+    let key = {
+        let mut s = state().lock().unwrap();
+        let sess = s.sessions.get_mut(&root).ok_or("尚未解锁（会话不存在）")?;
+        sess.last_activity = Instant::now();
+        sess.key.clone()
+    };
+    let app2 = app.clone();
+    let root2 = root.clone();
+    let n = tauri::async_runtime::spawn_blocking(move || {
+        vault::import(&root2, &key, &sources, &|done, total| {
+            let _ = app2.emit(
+                "vault-progress",
+                serde_json::json!({ "phase": "import", "done": done, "total": total }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))??;
+    Ok(n)
+}
+
+#[tauri::command]
+pub async fn vault_list(path: String) -> Result<Vec<vault::FileRow>, String> {
+    let root = root_of(&path)?;
+    let r = tauri::async_runtime::spawn_blocking(move || vault::list_files(&root))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    r
+}
+
+#[tauri::command]
+pub async fn vault_dissolve(path: String) -> Result<(), String> {
+    let root = root_of(&path)?;
+    let session = state()
+        .lock()
+        .unwrap()
+        .sessions
+        .remove(&root)
+        .ok_or("尚未解锁（会话不存在）")?;
+    let root2 = root.clone();
+    let key = session.key.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || vault::dissolve(&root2, &key))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    if res.is_err() {
+        // 恢复会话（箱还在）
+        state().lock().unwrap().sessions.insert(root, session);
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +318,7 @@ pub fn idle_seconds() -> u64 {
 }
 
 /// watcher 线程每 5 秒调用：空闲超时的会话逐个上锁。返回本次已上锁的路径列表。
-/// 上锁由 vault 内部持有较久（大文件加密），本函数不持 state 锁执行重活。
+/// 运行在独立线程，不阻塞主线程/UI。
 pub fn auto_lock_tick() -> Vec<String> {
     let threshold = state().lock().unwrap().auto_lock_secs;
     if threshold == 0 {
@@ -235,7 +334,7 @@ pub fn auto_lock_tick() -> Vec<String> {
     };
     let mut locked = Vec::new();
     for (root, key) in due {
-        match vault::lock(&root, &key) {
+        match vault::lock(&root, &key, &|_, _| {}) {
             Ok(_) => {
                 state().lock().unwrap().sessions.remove(&root);
                 locked.push(root.to_string_lossy().to_string());
@@ -259,7 +358,7 @@ pub fn lock_all_for_exit() -> Vec<String> {
     };
     let mut failed = Vec::new();
     for (root, key) in sessions {
-        match vault::lock(&root, &key) {
+        match vault::lock(&root, &key, &|_, _| {}) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[vaultbox] 退出上锁失败 {}: {e}", root.display());
@@ -281,8 +380,12 @@ pub fn force_exit() {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn hide_toggle(path: String) -> Result<hide::HideResult, String> {
-    hide::toggle(&root_of(&path)?)
+pub async fn hide_toggle(path: String) -> Result<hide::HideResult, String> {
+    let path = root_of(&path)?;
+    let r = tauri::async_runtime::spawn_blocking(move || hide::toggle(&path))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    r
 }
 
 #[tauri::command]
@@ -291,8 +394,12 @@ pub fn hide_is_hidden(path: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn hide_list_dir(path: String) -> Result<Vec<hide::HideResult>, String> {
-    hide::list_dir_state(&root_of(&path)?)
+pub async fn hide_list_dir(path: String) -> Result<Vec<hide::HideResult>, String> {
+    let path = root_of(&path)?;
+    let r = tauri::async_runtime::spawn_blocking(move || hide::list_dir_state(&path))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?;
+    r
 }
 
 // ---------------------------------------------------------------------------
